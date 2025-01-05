@@ -10,10 +10,11 @@ bl_info = {
 
 import bpy
 import bmesh
-import os
+
 
 def number(num):
     return f"{num:.16g}"
+
 
 class Export(bpy.types.Operator):
     bl_idname = "export_mesh.custom_bjw"
@@ -24,7 +25,7 @@ class Export(bpy.types.Operator):
     def execute(self, context):
         if not self.filepath.lower().endswith(".bjw"):
             self.filepath += ".bjw"
-        
+
         try:
             self.export_custom_format(context)
             self.report({'INFO'}, f"File exported to {self.filepath}")
@@ -78,16 +79,27 @@ class Export(bpy.types.Operator):
                             file.write(f"{number(uv[0])} {number(uv[1])}\n")
                             uv_index += 1
 
-            smooth = 1 if all(face.smooth for face in bm.faces) else 0
-            file.write("s\n")
-            file.write(f"{smooth}\n")
+            current_smooth = None
+            current_material = None
+            face_started = False
 
-            file.write("m\n")
-            for mat_slot in obj.material_slots:
-                file.write(f"{mat_slot.name}\n")
-
-            file.write("f\n")
             for face in bm.faces:
+                smooth = 1 if face.smooth else 0
+                material_index = face.material_index
+                material_name = obj.material_slots[material_index].material.name if material_index < len(obj.material_slots) else "None"
+
+                if smooth != current_smooth or material_name != current_material:
+                    if face_started:
+                        file.write("\n")  # End previous face group
+                    file.write("s\n")
+                    file.write(f"{smooth}\n")
+                    file.write("m\n")
+                    file.write(f"{material_name}\n")
+                    file.write("f\n")
+                    current_smooth = smooth
+                    current_material = material_name
+                    face_started = True
+
                 face_indices = []
                 for loop in face.loops:
                     v_idx = loop.vert.index + 1
@@ -96,33 +108,22 @@ class Export(bpy.types.Operator):
                     face_indices.append(f"{v_idx}/{uv_idx}")
                 file.write(".".join(face_indices) + "\n")
 
-            armature = next((mod.object for mod in obj.modifiers if mod.type == 'ARMATURE'), None)
-            if armature and armature.type == 'ARMATURE':
-                file.write("b\n")
-                for bone in armature.data.bones:
-                    parent_name = bone.parent.name if bone.parent else "None"
-                    head = bone.head_local
-                    file.write(f"{bone.name}/{parent_name}/{number(head.x)}/{number(head.y)}/{number(head.z)}\n")
-
-                file.write("w\n")
-                for vert in mesh.vertices:
-                    weights = [(g.group, g.weight) for g in vert.groups]
-                    if weights:
-                        weights_str = " ".join([f"{g}/{number(w)}" for g, w in weights])
-                        file.write(f"{vert.index + 1} {weights_str}\n")
-
             bm.free()
+
 
 def menu_func_export(self, context):
     self.layout.operator(Export.bl_idname, text="BJW (.bjw)")
+
 
 def register():
     bpy.utils.register_class(Export)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
+
 def unregister():
     bpy.utils.unregister_class(Export)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+
 
 if __name__ == "__main__":
     register()
