@@ -10,22 +10,111 @@ bl_info = {
 
 import bpy
 import bmesh
-
+import os
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 def number(num):
-    return f"{num:.16g}"
+    return int(num) if num == int(num) else f"{num:.7f}".rstrip('0').rstrip('.')
 
+# Global indices and locks
+vertex_lock = Lock()
+uv_lock = Lock()
+
+def write_vertices(bm, global_vertex_index, matrix_world):
+    output = []
+    vertex_map = {}
+    for vert in bm.verts:
+        transformed_vert = matrix_world @ vert.co
+        vertex_map[vert.index] = global_vertex_index
+        output.append(f"{number(transformed_vert.x)} {number(transformed_vert.z)} {number(-transformed_vert.y)}\n")
+        global_vertex_index += 1
+    return output, vertex_map, global_vertex_index
+
+def write_uvs(bm, uv_layer, global_uv_index, global_uv_dict):
+    output = []
+    if uv_layer:
+        for face in bm.faces:
+            for loop in face.loops:
+                uv = tuple(loop[uv_layer].uv)
+                if uv not in global_uv_dict:
+                    global_uv_dict[uv] = global_uv_index
+                    output.append(f"{number(uv[0])} {number(uv[1])}\n")
+                    global_uv_index += 1
+    return output, global_uv_index
+
+def write_faces(bm, uv_layer, vertex_map, global_uv_dict, obj):
+    output = []
+    current_smooth, current_material = None, None
+    for face in bm.faces:
+        smooth = 1 if face.smooth else 0
+        mat_idx = face.material_index
+        mat_name = obj.material_slots[mat_idx].material.name if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material else ""
+
+        if smooth != current_smooth or mat_name != current_material:
+            output.append(f"s\n{number(smooth)}\nm\n{mat_name}\nf\n")
+            current_smooth, current_material = smooth, mat_name
+
+        face_indices = [f"{vertex_map[loop.vert.index]}/{global_uv_dict.get(tuple(loop[uv_layer].uv), 0)}" if uv_layer else f"{vertex_map[loop.vert.index]}" for loop in face.loops]
+        output.append(".".join(face_indices) + "\n")
+    return output
+
+def process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, apply_modifiers):
+    def write_bones_and_weights(obj, vertex_map):
+        output = []
+        if obj.parent and obj.parent.type == 'ARMATURE':
+            armature = obj.parent
+            armature_matrix_world = armature.matrix_world
+
+            bone_to_group = {group.name: idx for idx, group in enumerate(obj.vertex_groups)}
+
+            for bone in armature.data.bones:
+                head_world = armature_matrix_world @ bone.head_local
+                head_adjusted = (head_world.x, head_world.z, -head_world.y)
+                parent = bone.parent.name if bone.parent else ""
+                output.append(f"b\n{bone.name}/{parent}/{number(head_adjusted[0])}/{number(head_adjusted[1])}/{number(head_adjusted[2])}\n")
+                group_index = bone_to_group.get(bone.name)
+                if group_index is not None:
+                    output.append("w\n")
+                    for vertex in obj.data.vertices:
+                        for group in vertex.groups:
+                            if group.group == group_index:
+                                output.append(f"{vertex_map[vertex.index]}/{number(group.weight)}\n")
+        return output
+
+    if obj.type != 'MESH':
+        return [], global_vertex_index, global_uv_index
+
+    temp_mesh = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh(preserve_all_data_layers=True) if apply_modifiers else obj.data
+
+    bm = bmesh.new()
+    bm.from_mesh(temp_mesh)
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    output = [f"o\n{obj.name}\n"]
+    vertex_data, vertex_map, global_vertex_index = write_vertices(bm, global_vertex_index, obj.matrix_world)
+    output.append("v\n" + "".join(vertex_data))
+    uv_layer = bm.loops.layers.uv.active
+    uv_data, global_uv_index = write_uvs(bm, uv_layer, global_uv_index, global_uv_dict)
+    if uv_data:
+        output.append("t\n" + "".join(uv_data))
+    output.extend(write_faces(bm, uv_layer, vertex_map, global_uv_dict, obj))
+    output.extend(write_bones_and_weights(obj, vertex_map))
+    bm.free()
+    if apply_modifiers:
+        obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh_clear()
+    return output, global_vertex_index, global_uv_index
 
 class Export(bpy.types.Operator):
     bl_idname = "export_mesh.custom_bjw"
     bl_label = "Export BJW"
-
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
-
+    thread_count: bpy.props.IntProperty(name="Thread Count", default=os.cpu_count(), min=1, max=os.cpu_count(), description="Number of threads to use for export")
+    apply_modifiers: bpy.props.BoolProperty(name="Apply Modifiers", default=False, description="Apply geometry modifiers during export")
     def execute(self, context):
         if not self.filepath.lower().endswith(".bjw"):
             self.filepath += ".bjw"
-
         try:
             self.export_custom_format(context)
             self.report({'INFO'}, f"File exported to {self.filepath}")
@@ -33,97 +122,36 @@ class Export(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
-
     def invoke(self, context, event):
         if not self.filepath:
             self.filepath = bpy.path.ensure_ext("Untitled", ".bjw")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
-
     def export_custom_format(self, context):
-        with open(self.filepath, 'w') as file:
-            obj = bpy.context.active_object
-
-            if obj is None or obj.type != 'MESH':
-                raise ValueError("No active mesh object found.")
-
-            mesh = obj.data
-            bm = bmesh.new()
-            bm.from_mesh(mesh)
-            bm.verts.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
-
-            file.write("l\n")
-            for mat_slot in obj.material_slots:
-                if mat_slot.material and mat_slot.material.name:
-                    file.write(f"{mat_slot.material.name}.mtl\n")
-
-            file.write("o\n")
-            file.write(f"{obj.name}\n")
-
-            file.write("v\n")
-            for vert in bm.verts:
-                x, y, z = vert.co.x, vert.co.y, vert.co.z
-                file.write(f"{number(x)} {number(z)} {number(-y)}\n")
-
-            uv_layer = bm.loops.layers.uv.active
-            if uv_layer:
-                file.write("t\n")
-                uv_dict = {}
-                uv_index = 1
-                for face in bm.faces:
-                    for loop in face.loops:
-                        uv = tuple(loop[uv_layer].uv)
-                        if uv not in uv_dict:
-                            uv_dict[uv] = uv_index
-                            file.write(f"{number(uv[0])} {number(uv[1])}\n")
-                            uv_index += 1
-
-            current_smooth = None
-            current_material = None
-            face_started = False
-
-            for face in bm.faces:
-                smooth = 1 if face.smooth else 0
-                material_index = face.material_index
-                material_name = obj.material_slots[material_index].material.name if material_index < len(obj.material_slots) else "None"
-
-                if smooth != current_smooth or material_name != current_material:
-                    if face_started:
-                        file.write("\n")  # End previous face group
-                    file.write("s\n")
-                    file.write(f"{smooth}\n")
-                    file.write("m\n")
-                    file.write(f"{material_name}\n")
-                    file.write("f\n")
-                    current_smooth = smooth
-                    current_material = material_name
-                    face_started = True
-
-                face_indices = []
-                for loop in face.loops:
-                    v_idx = loop.vert.index + 1
-                    uv = tuple(loop[uv_layer].uv) if uv_layer else None
-                    uv_idx = uv_dict[uv] if uv_layer and uv in uv_dict else 0
-                    face_indices.append(f"{v_idx}/{uv_idx}")
-                file.write(".".join(face_indices) + "\n")
-
-            bm.free()
-
+        global_vertex_index = 1
+        global_uv_index = 1
+        global_uv_dict = {}
+        objects_to_export = context.selected_objects if context.selected_objects else context.scene.objects
+        context.window_manager.progress_begin(0, len(objects_to_export))
+        try:
+            with open(self.filepath, 'w') as file:
+                for idx, obj in enumerate(objects_to_export):
+                    output, global_vertex_index, global_uv_index = process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, self.apply_modifiers)
+                    file.write("".join(output))
+                    context.window_manager.progress_update(idx + 1)
+        finally:
+            context.window_manager.progress_end()
 
 def menu_func_export(self, context):
     self.layout.operator(Export.bl_idname, text="BJW (.bjw)")
-
 
 def register():
     bpy.utils.register_class(Export)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
-
 def unregister():
     bpy.utils.unregister_class(Export)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
-
 
 if __name__ == "__main__":
     register()
