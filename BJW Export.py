@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 def number(num):
+    # return int(num) if num == int(num) else float(f"{num:.7f}".rstrip('0').rstrip('.'))
     return int(num) if num == int(num) else f"{num:.7f}".rstrip('0').rstrip('.')
 
 # Global indices and locks
@@ -59,9 +60,10 @@ def write_faces(bm, uv_layer, vertex_map, global_uv_dict, obj):
         output.append(".".join(face_indices) + "\n")
     return output
 
-def process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, apply_modifiers):
-    def write_bones_and_weights(obj, vertex_map):
-        output = []
+def process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, apply_modifiers, bones_data):
+    output = []
+
+    def collect_bones_and_weights(obj, vertex_map):
         if obj.parent and obj.parent.type == 'ARMATURE':
             armature = obj.parent
             armature_matrix_world = armature.matrix_world
@@ -69,18 +71,22 @@ def process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, ap
             bone_to_group = {group.name: idx for idx, group in enumerate(obj.vertex_groups)}
 
             for bone in armature.data.bones:
-                head_world = armature_matrix_world @ bone.head_local
-                head_adjusted = (head_world.x, head_world.z, -head_world.y)
-                parent = bone.parent.name if bone.parent else ""
-                output.append(f"b\n{bone.name}/{parent}/{number(head_adjusted[0])}/{number(head_adjusted[1])}/{number(head_adjusted[2])}\n")
+                if bone.name not in bones_data:
+                    head_world = armature_matrix_world @ bone.head_local
+                    head_adjusted = (head_world.x, head_world.z, -head_world.y)
+                    parent = bone.parent.name if bone.parent else ""
+                    bones_data[bone.name] = {
+                        "parent": parent,
+                        "head": head_adjusted,
+                        "weights": []
+                    }
+
                 group_index = bone_to_group.get(bone.name)
                 if group_index is not None:
-                    output.append("w\n")
                     for vertex in obj.data.vertices:
                         for group in vertex.groups:
-                            if group.group == group_index:
-                                output.append(f"{vertex_map[vertex.index]}/{number(group.weight)}\n")
-        return output
+                            if group.group == group_index and float(number(group.weight)) > 0:
+                                bones_data[bone.name]["weights"].append(f"{vertex_map[vertex.index]}/{number(group.weight)}")
 
     if obj.type != 'MESH':
         return [], global_vertex_index, global_uv_index
@@ -92,7 +98,7 @@ def process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, ap
     bm.verts.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
 
-    output = [f"o\n{obj.name}\n"]
+    output.append(f"o\n{obj.name}\n")
     vertex_data, vertex_map, global_vertex_index = write_vertices(bm, global_vertex_index, obj.matrix_world)
     output.append("v\n" + "".join(vertex_data))
     uv_layer = bm.loops.layers.uv.active
@@ -100,10 +106,12 @@ def process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, ap
     if uv_data:
         output.append("t\n" + "".join(uv_data))
     output.extend(write_faces(bm, uv_layer, vertex_map, global_uv_dict, obj))
-    output.extend(write_bones_and_weights(obj, vertex_map))
+    collect_bones_and_weights(obj, vertex_map)
     bm.free()
+
     if apply_modifiers:
         obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh_clear()
+
     return output, global_vertex_index, global_uv_index
 
 class Export(bpy.types.Operator):
@@ -112,6 +120,7 @@ class Export(bpy.types.Operator):
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
     thread_count: bpy.props.IntProperty(name="Thread Count", default=os.cpu_count(), min=1, max=os.cpu_count(), description="Number of threads to use for export")
     apply_modifiers: bpy.props.BoolProperty(name="Apply Modifiers", default=False, description="Apply geometry modifiers during export")
+
     def execute(self, context):
         if not self.filepath.lower().endswith(".bjw"):
             self.filepath += ".bjw"
@@ -122,23 +131,36 @@ class Export(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
+
     def invoke(self, context, event):
         if not self.filepath:
-            self.filepath = bpy.path.ensure_ext("Untitled", ".bjw")
+            blend_name = bpy.path.basename(bpy.data.filepath).replace('.blend', '')
+            self.filepath = bpy.path.ensure_ext(blend_name if blend_name else "Untitled", ".bjw")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+
     def export_custom_format(self, context):
         global_vertex_index = 1
         global_uv_index = 1
         global_uv_dict = {}
+        bones_data = {}
         objects_to_export = context.selected_objects if context.selected_objects else context.scene.objects
         context.window_manager.progress_begin(0, len(objects_to_export))
+
         try:
             with open(self.filepath, 'w') as file:
                 for idx, obj in enumerate(objects_to_export):
-                    output, global_vertex_index, global_uv_index = process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, self.apply_modifiers)
+                    output, global_vertex_index, global_uv_index = process_object(obj, global_uv_dict, global_vertex_index, global_uv_index, self.apply_modifiers, bones_data)
                     file.write("".join(output))
                     context.window_manager.progress_update(idx + 1)
+
+                # Write combined bones and weights at the end
+                for bone_name, bone_data in bones_data.items():
+                    if bone_data["weights"]:  # Only write bones with weights
+                        head_adjusted = bone_data["head"]
+                        parent = bone_data["parent"]
+                        file.write(f"b\n{bone_name}/{parent}/{number(head_adjusted[0])}/{number(head_adjusted[1])}/{number(head_adjusted[2])}\n")
+                        file.write("w\n" + "\n".join(bone_data["weights"]) + "\n")
         finally:
             context.window_manager.progress_end()
 
