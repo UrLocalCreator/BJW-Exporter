@@ -15,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 def number(num):
-    # return int(num) if num == int(num) else float(f"{num:.7f}".rstrip('0').rstrip('.'))
     return int(num) if num == int(num) else f"{num:.7f}".rstrip('0').rstrip('.')
 
 # Global indices and locks
@@ -156,7 +155,7 @@ class Export(bpy.types.Operator):
 
                 # Write combined bones and weights at the end
                 for bone_name, bone_data in bones_data.items():
-                    if bone_data["weights"]:  # Only write bones with weights
+                    if bone_data["weights"]:
                         head_adjusted = bone_data["head"]
                         parent = bone_data["parent"]
                         file.write(f"b\n{bone_name}/{parent}/{number(head_adjusted[0])}/{number(head_adjusted[1])}/{number(head_adjusted[2])}\n")
